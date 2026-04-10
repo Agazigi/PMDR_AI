@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-
+# 不带参数的层
 class CenteredLayer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -10,7 +10,7 @@ class CenteredLayer(nn.Module):
     def forward(self, X):
         return X - X.mean()
     
-    
+# 带参数的层
 class MyLinear(nn.Module):
     def __init__(self, in_units, units):
         super().__init__()
