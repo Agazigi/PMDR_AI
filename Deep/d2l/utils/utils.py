@@ -24,6 +24,435 @@ DATA_HUB ={
     'fra-eng': (DATA_URL + 'fra-eng.zip', '94646ad1522d915e7b0f9296181140edcf86a4f5')
 }
 
+class Encoder(nn.Module):
+    """编码器"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def forward(self, X, *args):
+        raise NotImplementedError
+    
+class Decoder(nn.Module):
+    """解码器"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+    def init_state(self, enc_outputs, *args):
+        raise NotImplementedError
+    
+    def forward(self, X, state):
+        raise NotImplementedError
+
+class AttentionDecoder(Decoder):
+    """注意力解码器"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    @property
+    def attention_weights(self):
+        raise NotImplementedError
+
+class EncoderDecoder(nn.Module):
+    """编码解码器"""
+    def __init__(self, encoder, decoder, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.encoder = encoder
+        self.decoder = decoder
+    
+    def forward(self, enc_X, dec_X, *args):
+        # 编码器的输入
+        # 解码器的输入
+        enc_outputs = self.encoder(enc_X, *args)
+        dec_state = self.decoder.init_state(enc_outputs, *args)
+        return self.decoder(dec_X, dec_state)
+
+
+class Seq2SeqEncoder(Encoder):
+    """序列到序列编码器"""
+    def __init__(self, vocab_size, embed_size, num_hiddens, num_layers, dropout=0, **kwargs):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size) # 词嵌入层
+        self.rnn = nn.GRU(embed_size, num_hiddens, num_layers, dropout=dropout)
+    
+    def forward(self, X, *args):
+        """前向传播"""
+        X = self.embedding(X) # [batch_size, num_steps, embed_size]
+        X = X.permute(1, 0, 2) # [num_steps, batch_size, embed_size]
+        output, state = self.rnn(X)
+        # output: [num_steps, batch_size, num_hiddens]
+        # state: [num_layers, batch_size, num_hiddens]
+        return output, state
+    
+
+class Seq2SeqDecoder(Decoder):
+    """序列到序列解码器"""
+    def __init__(self, vocab_size, embed_size, num_hiddens, num_layers, dropout=0, **kwargs) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size) # 词嵌入层
+        self.rnn = nn.GRU(embed_size + num_hiddens, num_hiddens, num_layers, dropout=dropout)
+        self.dense = nn.Linear(num_hiddens, vocab_size) # 最后一层全连接层，输出词表大小
+        
+    def init_state(self, enc_outputs, *args):
+        """Encoder 的最后一个时间步的输出状态作为解码器的输入隐状态"""
+        # 取出 state
+        # return enc_outputs[1] # [num_layers, batch_size, num_hiddens]
+        return (enc_outputs[1], enc_outputs[1][-1]) # 第一个是编码器的输出状态，第二个是编码器的最后一个时间步的输出状态
+        
+    def forward(self, X, state):
+        # X: [batch_size, num_steps]
+        """前向传播"""
+        X = self.embedding(X).permute(1, 0, 2) # [num_steps, batch_size, embed_size]
+        
+        context = state[-1] # 最后一个时间步的输出状态
+        # state: [batch_size, num_hiddens]
+        context = context.repeat(X.shape[0], 1, 1) # [num_steps, batch_size, num_hiddens]
+        
+        # [NOTE] 这里编码器的输出状态 encode 是一个元组，第一个元素是编码器的输出状态，第二个元素是编码器的最后一个时间步的输出状态
+        # 这样保证了 context 是一个恒定的量，一直是编码器的最后一个时间步的输出状态，固定不变
+        # 从而没有忘记原文的上下文信息
+        encode = state[1] # 这里只有两层，所以 encode 就是 state[1] 的最后一个时间步的输出状态
+        state = state[0]
+        
+        
+        dec_input = torch.cat((X, context), dim=2) # [num_steps, batch_size, embed_size + num_hiddens]
+        
+        
+        # output: [num_steps, batch_size, num_hiddens]
+        # state: [num_layers, batch_size, num_hiddens]
+        output, state = self.rnn(dec_input, state)
+        
+        
+        # 这里又是一个全连接层，输出词表大小。后续做 softmax 函数求概率
+        output = self.dense(output).permute(1, 0, 2) # [batch_size, num_steps, vocab_size]
+        # return output, state
+        return output, (state, encode)
+
+
+
+class PositionWiseFFN(nn.Module):
+    """基于位置的前馈神经网络"""
+    def __init__(self, ffn_num_input, ffn_num_hiddens, ffn_num_outputs, **kwargs):
+        super().__init__(**kwargs)
+        self.ffn = nn.Sequential(
+            nn.Linear(ffn_num_input, ffn_num_hiddens),
+            nn.ReLU(),
+            nn.Linear(ffn_num_hiddens, ffn_num_outputs)
+        )
+    
+    def forward(self, X):
+        # X: [batch_size, seq_len, hidden_dim]
+        return self.ffn(X) # [batch_size, seq_len, ffn_num_outputs]
+    
+class AddNorm(nn.Module):
+    """残差连接"""
+    def __init__(self, normalized_shape, dropout, **kwargs):
+        super().__init__(**kwargs)
+        self.ln = nn.LayerNorm(normalized_shape)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, X, Y):
+        return self.ln(self.dropout(Y) + X)
+    
+class EncoderBlock(nn.Module):
+    """Transformer 编码器块"""
+    def __init__(self, k_size, q_size, v_size, num_hiddens, norm_shape, ffn_num_input, ffn_num_hiddens, num_heads, dropout, use_bias=False, **kwargs):
+        super().__init__(**kwargs)
+        self.attention = MultiHeadAttention(k_size, q_size, v_size, num_hiddens, num_heads, dropout, use_bias)
+        self.add_norm_1 = AddNorm(norm_shape, dropout)
+        self.ffn = PositionWiseFFN(ffn_num_input, ffn_num_hiddens, num_hiddens)
+        self.add_norm_2 = AddNorm(norm_shape, dropout)
+
+    def forward(self, X, valid_lens):
+        Y = self.add_norm_1(X, self.attention(X, X, X, valid_lens))
+        return self.add_norm_2(Y, self.ffn(Y))
+    
+class PositionalEncoding(nn.Module):
+    """位置编码"""
+    def __init__(self, num_hiddens, dropout, max_len=1000):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.P = torch.zeros((1, max_len, num_hiddens))
+        X = torch.arange(max_len, dtype=torch.float32).reshape(-1, 1) / torch.pow(10000, torch.arange(0, num_hiddens, 2, dtype=torch.float32) / num_hiddens)
+        self.P[:, :, 0::2] = torch.sin(X)
+        self.P[:, :, 1::2] = torch.cos(X)
+    
+    def forward(self, X):
+        X = X + self.P[:, :X.shape[1], :].to(X.device)
+        return self.dropout(X)
+    
+    
+class DotProductAttention(nn.Module):
+    """点积注意力机制"""
+    def __init__(self, dropout, **kwargs):
+        super().__init__(**kwargs)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, q, k, v, valid_lens=None):
+        d = q.shape[-1] # q_dim = k_dim
+        
+        # [batch_size * num_heads, seq_len, hidden_dim / num_heads] * [batch_size * num_heads, hidden_dim / num_heads, seq_len] -> [batch_size * num_heads, seq_len, seq_len]
+        scores = torch.bmm(q, k.transpose(1, 2)) / math.sqrt(d) # [batch_size * num_heads, seq_len, seq_len]
+        self.attention_weights = masked_softmax(scores, valid_lens)
+        
+        # [batch_size * num_heads, seq_len, seq_len] * [batch_size * num_heads, seq_len, hidden_dim / num_heads] -> [batch_size * num_heads, seq_len, hidden_dim / num_heads]
+        return torch.bmm(self.dropout(self.attention_weights), v) # [batch_size * num_heads, seq_len, hidden_dim / num_heads]
+ 
+def transpose_qkv(X, num_heads):
+    """转置 qkv 三个矩阵"""
+    # X: [batch_size, seq_len, hidden_dim]
+    
+    # X: [batch_size, seq_len, num_hiddens, hidden_dim / num_heads]
+    X = X.reshape(X.shape[0], X.shape[1], num_heads, -1)
+    
+    # X: [batch_size, num_heads, seq_len, hidden_dim / num_heads]
+    X = X.permute(0, 2, 1, 3)
+    
+    # X: [batch_size * num_heads, seq_len, hidden_dim / num_heads]
+    return X.reshape(-1, X.shape[2], X.shape[3])
+    
+    
+def transpose_output(X, num_heads):
+    """转置输出"""
+    # X: [batch_size * num_heads, seq_len, hidden_dim / num_heads]
+    
+    # X: [batch_size, num_heads, seq_len, hidden_dim / num_heads]
+    X = X.reshape(-1, num_heads, X.shape[1], X.shape[2])
+    
+    # X: [batch_size, seq_len, num_heads, hidden_dim / num_heads]
+    X = X.permute(0, 2, 1, 3)
+    
+    # X: [batch_size, seq_len, hidden_dim]
+    # 相当于拼成了一个大的矩阵
+    return X.reshape(X.shape[0], X.shape[1], -1)
+ 
+class MultiHeadAttention(nn.Module):
+    """多头注意力机制"""
+    def __init__(self, k_size, q_size, v_size, num_hiddens, num_heads, dropout, bias=False, **kwargs):
+        super().__init__()
+        self.num_heads = num_heads # 头数
+        self.attention = DotProductAttention(dropout)
+        self.W_q = nn.Linear(q_size, num_hiddens, bias=bias)
+        self.W_k = nn.Linear(k_size, num_hiddens, bias=bias)
+        self.W_v = nn.Linear(v_size, num_hiddens, bias=bias)
+        self.W_o = nn.Linear(num_hiddens, num_hiddens, bias=bias)
+        
+        
+    def forward(self, q, k, v, valid_lens=None):
+        # q: [batch_size, q_seq_len, q_dim]
+        # k: [batch_size, k_seq_len, k_dim]
+        # v: [batch_size, v_seq_len, v_dim]
+        
+        q = transpose_qkv(self.W_q(q), self.num_heads)
+        k = transpose_qkv(self.W_k(k), self.num_heads)
+        v = transpose_qkv(self.W_v(v), self.num_heads)
+        # q: [batch_size * num_heads, q_seq_len, hidden_dim / num_heads]
+        # k: [batch_size * num_heads, k_seq_len, hidden_dim / num_heads]
+        # v: [batch_size * num_heads, v_seq_len, hidden_dim / num_heads]
+        
+        
+        
+        if valid_lens is not None: 
+            # valid_lens: [batch_size, ]
+            
+            valid_lens = torch.repeat_interleave(valid_lens, repeats=self.num_heads, dim=0) 
+            # [batch_size * num_heads,]
+            
+        output = self.attention(q, k, v, valid_lens)
+        # output: [batch_size * num_heads, q_seq_len, hidden_dim / num_heads]
+        
+        output_concat = transpose_output(output, self.num_heads)
+        # [batch_size, q_seq_len, hidden_dim]
+        return self.W_o(output_concat) # [batch_size, q_seq_len, hidden_dim]
+    
+class TransformerEncoder(Encoder):
+    """Transformer 编码器"""
+    def __init__(self, vocab_size, k_size, q_size, v_size, num_hiddens, norm_shape,
+                 ffn_num_input, ffn_num_hiddens, num_heads, num_layers, dropout, use_bias=False, **kwargs):
+        super().__init__(**kwargs)
+        self.num_hiddens = num_hiddens
+        self.embedding = nn.Embedding(vocab_size, num_hiddens)
+        self.position_encoding = PositionalEncoding(num_hiddens, dropout)
+        self.blocks = nn.Sequential()
+        for _ in range(num_layers):
+            self.blocks.add_module(
+                f'block_{_}',
+                EncoderBlock(
+                    k_size, q_size, v_size, num_hiddens, norm_shape, ffn_num_input,
+                    ffn_num_hiddens, num_heads, dropout, use_bias
+                )
+            )
+        self.attention_weights = [None] * num_layers
+            
+    def forward(self, X, valid_lens, *args):
+        # 因为位置编码值在-1和1之间，
+        # 因此嵌入值乘以嵌入维度的平方根进行缩放，
+        # 然后再与位置编码相加。
+        X = self.embedding(X) * math.sqrt(self.num_hiddens)
+        X = self.position_encoding(X)
+        for i, block in enumerate(self.blocks):
+            X = block(X, valid_lens)
+            self.attention_weights[i] = block.attention.attention.attention_weights
+        return X
+        
+class DecoderBlock(nn.Module):
+    """Transformer 解码器块 第 i 个块"""
+    def __init__(self, k_size, q_size, v_size, num_hiddens, norm_shape,
+                 ffn_num_input, ffn_num_hiddens, num_heads, dropout, i, **kwargs):
+        super().__init__(**kwargs)
+        self.i = i
+        self.mask_attention = MultiHeadAttention(k_size, q_size, v_size, num_hiddens, num_heads, dropout)
+        self.add_norm_1 = AddNorm(norm_shape, dropout)
+        
+        self.cross_attention = MultiHeadAttention(k_size, q_size, v_size, num_hiddens, num_heads, dropout)
+        self.add_norm_2 = AddNorm(norm_shape, dropout)
+        
+        self.ffn = PositionWiseFFN(ffn_num_input, ffn_num_hiddens, num_hiddens)
+        self.add_norm_3 = AddNorm(norm_shape, dropout)
+        
+    def forward(self, X, state):
+        enc_outputs, enc_valid_lens = state[0], state[1]
+        
+        # if state[2][self.i] is None:
+        #     key_values = X
+        # else:
+        #     key_values = torch.cat((state[2][self.i], X), dim=1)
+        
+            
+        # if self.training:
+        #     batch_size, seq_len, _ = X.shape
+        #     dec_valid_lens = torch.arange(1, seq_len + 1, device=X.device).repeat(batch_size, 1)
+        # else:
+        #     dec_valid_lens = None
+        
+        
+        batch_size, seq_len, _ = X.shape
+        dec_valid_lens = torch.arange(1, seq_len + 1, device=X.device).repeat(batch_size, 1)
+        
+            
+        # mask_attention_X = self.mask_attention(X, key_values, key_values, dec_valid_lens)
+        mask_attention_X = self.mask_attention(X, X, X, dec_valid_lens)
+        X = self.add_norm_1(X, mask_attention_X)
+        
+        cross_attention_X = self.cross_attention(X, enc_outputs, enc_outputs, enc_valid_lens)
+        X = self.add_norm_2(X, cross_attention_X)
+        X = self.add_norm_3(X, self.ffn(X))
+        return X, state
+
+class TransformerDecoder(Decoder):
+    """Transformer 解码器"""
+    def __init__(self, vocab_size, k_size, q_size, v_size, num_hiddens, norm_shape,
+                 ffn_num_input, ffn_num_hiddens, num_heads, num_layers, dropout, **kwargs):
+        super().__init__(**kwargs)
+        self.num_hiddens = num_hiddens
+        self.num_layers = num_layers
+        self.embedding = nn.Embedding(vocab_size, num_hiddens)
+        self.position_encoding = PositionalEncoding(num_hiddens, dropout)
+        self.blocks = nn.Sequential()
+        for i in range(num_layers):
+            self.blocks.add_module(
+                f'block_{i}',
+                DecoderBlock(
+                    k_size, q_size, v_size, num_hiddens, norm_shape, ffn_num_input,
+                    ffn_num_hiddens, num_heads, dropout, i
+                )
+            )
+        self.dense = nn.Linear(num_hiddens, vocab_size)
+        
+    def init_state(self, enc_outputs, enc_valid_lens, *args):
+        self.seqX = None
+        return [enc_outputs, enc_valid_lens]
+    
+        # return [enc_outputs, enc_valid_lens, [None] * self.num_layers]
+    
+    def forward(self, X, state):
+        if not self.training:
+            self.seqX = X if self.seqX is None else torch.cat((self.seqX, X), dim=1)
+            X = self.seqX
+            
+        X = self.position_encoding(self.embedding(X) * math.sqrt(self.num_hiddens))
+        self._attention_weights = [[None] * len(self.blocks) for _ in range(2)]
+        for i, block in enumerate(self.blocks):
+            X, state = block(X, state)
+            self._attention_weights[0][i] = block.mask_attention.attention.attention_weights
+            self._attention_weights[1][i] = block.cross_attention.attention.attention_weights
+        
+        if not self.training:
+            return self.dense(X)[:, -1:, :], state
+        
+        return self.dense(X), state
+    
+    @property
+    def attention_weights(self):
+        return self._attention_weights
+        
+        
+
+
+
+        
+
+class AdditiveAttention(nn.Module):
+    """加性注意力机制"""
+    def __init__(self, k_size, q_size, num_hiddens, dropout, **kwargs):
+        super().__init__()
+        self.W_k = nn.Linear(k_size, num_hiddens, bias=False)
+        self.W_q = nn.Linear(q_size, num_hiddens, bias=False)
+        self.W_v = nn.Linear(num_hiddens, 1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, q, k, v, valid_lens):
+        # q: [batch_size, num_steps, q_dim]
+        # k: [batch_size, num_steps, k_dim]
+        
+        # 经过一个 Linear 层
+        q, k = self.W_q(q), self.W_k(k)
+        # q: [batch_size, num_steps, num_hiddens]
+        # k: [batch_size, num_steps, num_hiddens]
+        
+        
+        q_k = q.unsqueeze(2) + k.unsqueeze(1) # [batch_size, num_steps, num_steps, num_hiddens]
+        q_k = torch.tanh(q_k) # [batch_size, num_steps, num_steps, num_hiddens]
+        # tanh 提供了非线性变换
+        
+        scores = self.W_v(q_k).squeeze(-1) # 
+        # scores: [batch_size, num_steps, num_steps]
+        self.attention_weights = masked_softmax(scores, valid_lens) # 掩码 softmax 函数
+        
+        # 返回加性注意力
+        # [batch_size, num_steps, num_steps] * [batch_size, num_steps, v_dim] -> [batch_size, num_steps, v_dim]
+        return torch.bmm(self.dropout(self.attention_weights), v)
+        
+
+def masked_softmax(X, valid_lens):
+    """掩码 softmax 函数"""
+    if valid_lens is None: # 没有掩码
+        return nn.functional.softmax(X, dim=-1) # 每行进行 softmax
+    else:
+        shape = X.shape # 获取矩阵的形状
+        if valid_lens.dim() == 1: # 如果 valid_lens 是一维的
+            valid_lens = torch.repeat_interleave(valid_lens, shape[1]) # 将 valid_lens 复制到每个样本的每个位置上
+        else:
+            valid_lens = valid_lens.reshape(-1) # 变成一维的向量
+        X = sequence_mask(X.reshape(-1, shape[-1]), valid_lens, value=-1e6) # 对矩阵进行掩码，将无效的位置设为 -1e6
+        return nn.functional.softmax(X.reshape(shape), dim=-1) # 每行进行 softmax
+
+def show_heatmaps(matrices, xlabel, ylabel, titles=None, figsize=(2.5, 2.5), cmap='Reds'):
+    """显示注意力权重的热力图"""
+    num_rows, num_cols = matrices.shape[0], matrices.shape[1]
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=figsize, sharex=True, sharey=True, squeeze=False)
+    # sharex=True, sharey=True 表示共享x轴和y轴， 用于显示热力图的坐标轴
+    # squeeze=False 表示不压缩子图， 用于显示热力图的坐标轴
+    
+    for i, (row_axes, row_matrices) in enumerate(zip(axes, matrices)):
+        for j, (ax, matrix) in enumerate(zip(row_axes, row_matrices)):
+            pcm = ax.imshow(matrix.detach().numpy(), cmap=cmap) # 显示热力图
+            if i == num_rows - 1:
+                ax.set_xlabel(xlabel)
+            if j == 0:
+                ax.set_ylabel(ylabel)
+            if titles is not None:
+                ax.set_title(titles[j])
+    fig.colorbar(pcm, ax=axes, shrink=0.6) # 显示颜色条 shrink=0.6 表示颜色条的宽度
 
 
 def train_seq2seq(model, data_iter, lr, num_epochs, tgt_vocab, device):
@@ -157,39 +586,6 @@ class MaskedSoftmaxCrossEntropyLoss(nn.CrossEntropyLoss):
         return loss
 
 
-class Encoder(nn.Module):
-    """编码器"""
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-    
-    def forward(self, X, *args):
-        raise NotImplementedError
-    
-class Decoder(nn.Module):
-    """解码器"""
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        
-    def init_state(self, enc_outputs, *args):
-        raise NotImplementedError
-    
-    def forward(self, X, state):
-        raise NotImplementedError
-
-
-class EncoderDecoder(nn.Module):
-    """编码解码器"""
-    def __init__(self, encoder, decoder, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.encoder = encoder
-        self.decoder = decoder
-    
-    def forward(self, enc_X, dec_X, *args):
-        # 编码器的输入
-        # 解码器的输入
-        enc_outputs = self.encoder(enc_X, *args)
-        dec_state = self.decoder.init_state(enc_outputs, *args)
-        return self.decoder(dec_X, dec_state)
 
 
 def build_array_nmt(lines, vocab, num_steps):
