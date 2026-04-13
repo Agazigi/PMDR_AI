@@ -164,7 +164,7 @@ class EncoderBlock(nn.Module):
 
     def forward(self, X, valid_lens):
         Y = self.add_norm_1(X, self.attention(X, X, X, valid_lens))
-        return self.add_norm_2(Y, self.ffn(Y))
+        return self.add_norm_2(Y, self.ffn(Y)) # [batch_size, seq_len, num_hiddens]
     
 class PositionalEncoding(nn.Module):
     """位置编码"""
@@ -188,11 +188,14 @@ class DotProductAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, q, k, v, valid_lens=None):
-        d = q.shape[-1] # q_dim = k_dim
+        d = q.shape[-1] # q_dim = k_dim = v_dim
+        # q: [batch_size * num_heads, q_seq_len, hidden_dim / num_heads]
+        # k: [batch_size * num_heads, k_seq_len, hidden_dim / num_heads]
+        # v: [batch_size * num_heads, v_seq_len, hidden_dim / num_heads]
         
         # [batch_size * num_heads, seq_len, hidden_dim / num_heads] * [batch_size * num_heads, hidden_dim / num_heads, seq_len] -> [batch_size * num_heads, seq_len, seq_len]
         scores = torch.bmm(q, k.transpose(1, 2)) / math.sqrt(d) # [batch_size * num_heads, seq_len, seq_len]
-        self.attention_weights = masked_softmax(scores, valid_lens)
+        self.attention_weights = masked_softmax(scores, valid_lens) # [batch_size * num_heads, seq_len, seq_len]
         
         # [batch_size * num_heads, seq_len, seq_len] * [batch_size * num_heads, seq_len, hidden_dim / num_heads] -> [batch_size * num_heads, seq_len, hidden_dim / num_heads]
         return torch.bmm(self.dropout(self.attention_weights), v) # [batch_size * num_heads, seq_len, hidden_dim / num_heads]
@@ -287,11 +290,19 @@ class TransformerEncoder(Encoder):
         # 因为位置编码值在-1和1之间，
         # 因此嵌入值乘以嵌入维度的平方根进行缩放，
         # 然后再与位置编码相加。
+        
+        # X: [batch_size, seq_len]
         X = self.embedding(X) * math.sqrt(self.num_hiddens)
+        # X: [batch_size, seq_len, num_hiddens]
+        
+        
         X = self.position_encoding(X)
+        # X: [batch_size, seq_len, num_hiddens]
+        
+        
         for i, block in enumerate(self.blocks):
             X = block(X, valid_lens)
-            self.attention_weights[i] = block.attention.attention.attention_weights
+            self.attention_weights[i] = block.attention.attention.attention_weights # 存放不同层 block 的注意力权重矩阵
         return X
         
 class DecoderBlock(nn.Module):
@@ -312,15 +323,18 @@ class DecoderBlock(nn.Module):
     def forward(self, X, state):
         enc_outputs, enc_valid_lens = state[0], state[1]
         
-        # if state[2][self.i] is None:
-        #     key_values = X
-        # else:
-        #     key_values = torch.cat((state[2][self.i], X), dim=1)
         
-            
-        # if self.training:
-        #     batch_size, seq_len, _ = X.shape
-        #     dec_valid_lens = torch.arange(1, seq_len + 1, device=X.device).repeat(batch_size, 1)
+        # REMOVE  
+        # if state[2][self.i] is None: # 训练时
+        #     key_values = X
+        # else: # 预测时，需要将上一个时间步的输出状态拼接起来，作为当前时间步的输入状态
+        #     key_values = torch.cat((state[2][self.i], X), axis=1)
+        # state[2][self.i] = key_values
+        # if self.training: # 掩码
+        #     batch_size, num_steps, _ = X.shape
+        #     # dec_valid_lens的开头:(batch_size,num_steps),
+        #     # 其中每一行是[1,2,...,num_steps]
+        #     dec_valid_lens = torch.arange(1, num_steps + 1, device=X.device).repeat(batch_size, 1)
         # else:
         #     dec_valid_lens = None
         
@@ -359,25 +373,28 @@ class TransformerDecoder(Decoder):
         self.dense = nn.Linear(num_hiddens, vocab_size)
         
     def init_state(self, enc_outputs, enc_valid_lens, *args):
-        self.seqX = None
+        # ADD
+        self.seqX = None # 记录之前预测的状态
         return [enc_outputs, enc_valid_lens]
     
         # return [enc_outputs, enc_valid_lens, [None] * self.num_layers]
     
     def forward(self, X, state):
-        if not self.training:
-            self.seqX = X if self.seqX is None else torch.cat((self.seqX, X), dim=1)
+        # ADD
+        if not self.training: # 预测时
+            self.seqX = X if self.seqX is None else torch.cat((self.seqX, X), dim=1) # 拼接上一个时间步的输出状态和当前时间步的输入状态
             X = self.seqX
             
-        X = self.position_encoding(self.embedding(X) * math.sqrt(self.num_hiddens))
+        X = self.position_encoding(self.embedding(X) * math.sqrt(self.num_hiddens)) # 预测时，加上之前预测的结果。使用位置编码
         self._attention_weights = [[None] * len(self.blocks) for _ in range(2)]
         for i, block in enumerate(self.blocks):
             X, state = block(X, state)
             self._attention_weights[0][i] = block.mask_attention.attention.attention_weights
             self._attention_weights[1][i] = block.cross_attention.attention.attention_weights
         
-        if not self.training:
-            return self.dense(X)[:, -1:, :], state
+        # ADD
+        if not self.training: # 如果是预测
+            return self.dense(X)[:, -1:, :], state # 选出最后一个时间步作为输出
         
         return self.dense(X), state
     

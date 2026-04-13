@@ -25,6 +25,10 @@ decoder = TransformerDecoder(
     num_heads, num_layers, dropout
 )
 net = EncoderDecoder(encoder, decoder)
+n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+print(f'Number of parameters: {n_params:,}')
+
+
 train_seq2seq(net, train_iter, lr, num_epochs, tgt_vocab, device)
 plt.show()
 
@@ -36,7 +40,7 @@ for eng, fra in zip(engs, fras):
           f'bleu {bleu(translation, fra, k=2):.3f}')
     
 enc_attention_weights = torch.cat(net.encoder.attention_weights, 0).reshape((num_layers, num_heads, -1, num_steps))
-print(enc_attention_weights.shape)
+print(enc_attention_weights.shape) # [num_layers, num_heads, seq_len, seq_len]
 
 show_heatmaps(
     enc_attention_weights.cpu(), xlabel='Key positions',
@@ -46,13 +50,14 @@ show_heatmaps(
 
 dec_attention_weights_2d = [head[-1].tolist()
                             for step in dec_attention_weight_seq
-                            for attn in step for blk in attn for head in blk]
+                            for attn in step 
+                            for blk in attn 
+                            for head in blk]
 dec_attention_weights_filled = torch.tensor(pd.DataFrame(dec_attention_weights_2d).fillna(0.0).values)
 dec_attention_weights = dec_attention_weights_filled.reshape((-1, 2, num_layers, num_heads, num_steps))
 dec_self_attention_weights, dec_inter_attention_weights = dec_attention_weights.permute(1, 2, 3, 0, 4)
-print(dec_self_attention_weights.shape, dec_inter_attention_weights.shape)
+print(dec_self_attention_weights.shape, dec_inter_attention_weights.shape) # [num_layers, num_heads, num_steps, seq_len]
 
-# Plusonetoincludethebeginning-of-sequencetoken
 show_heatmaps(
     dec_self_attention_weights[:, :, :, :len(translation.split()) + 1],
     xlabel='Key positions', ylabel='Query positions',
