@@ -1,9 +1,13 @@
-from turtle import forward
 import torch
 import torch.nn as nn
-
+import sys
+sys.path.append('../utils')
+from utils import *
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 class PatchEmbedding(nn.Module):
+    """图像嵌入层"""
     def __init__(self, img_size, patch_size, num_hiddens):
         super().__init__()
         def _make_tuple(x):
@@ -12,12 +16,12 @@ class PatchEmbedding(nn.Module):
             return x
         img_size, patch_size = _make_tuple(img_size), _make_tuple(patch_size)
         self.num_patches = (img_size[0] // patch_size[0]) * (img_size[1] // patch_size[1])
-        self.conv = nn.Conv2d(in_channels=3, out_channels=num_hiddens, kernel_size=patch_size, stride=patch_size)
+        self.conv = nn.LazyConv2d(out_channels=num_hiddens, kernel_size=patch_size, stride=patch_size)
         
     def forward(self, X):
         # X: [batch_size, num_channels, img_size, img_size]
         # conv(x): [batch_size, num_hiddens, img_size//patch_size, img_size//patch_size]
-        X = self.conv(X).flatten(2).transpose(1, 2) # [batch_size, (img_size//patch_size)**2, num_hiddens]
+        X = self.conv(X).flatten(2).transpose(1, 2) # [batch_size, num_patches, num_hiddens]
         return X
 
 img_size, patch_size, num_hiddens, batch_size = 96, 16, 512, 4
@@ -35,20 +39,23 @@ class ViTMLP(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         
     def forward(self, X):
+        # X: [batch_size, num_patches+1, num_hiddens]
         X = self.dropout1(self.gelu(self.dense1(X)))
+        # X: [batch_size, num_patches+1, mlp_num_hiddens]
         X = self.dropout2(self.dense2(X))
+        # X: [batch_size, num_patches+1, num_hiddens]
         return X
        
 class ViTBlock(nn.Module):
     def __init__(self, num_hiddens, norm_shape, mlp_num_hiddens, num_heads, dropout, use_bias=False):
         super().__init__()
         self.ln1 = nn.LayerNorm(norm_shape)
-        self.attention = MultiHeadAttention(num_hiddens, num_heads, dropout, use_bias)
+        self.attention = MultiHeadAttention(num_hiddens, num_hiddens, num_hiddens, num_hiddens, num_heads, dropout, use_bias)
         self.ln2 = nn.LayerNorm(norm_shape)
         self.mlp = ViTMLP(mlp_num_hiddens, num_hiddens)
     
     def forward(self, X, valid_lens=None):
-        # X: 
+        # X: [batch_size, num_patches+1, num_hiddens]
         X = X + self.attention(*([self.ln1(X)] * 3), valid_lens)
         X = X + self.mlp(self.ln2(X))
         return X
@@ -64,7 +71,6 @@ class ViT(nn.Module):
     def __init__(self, img_size, patch_size, num_hiddens, mlp_num_hiddens, num_heads, 
                  num_blocks, emb_dropout, block_dropout, lr=0.1, use_bias=False, num_classes=10):
         super().__init__()
-        self.save_hyperparameters() # 保存超参数
         self.patch_embedding = PatchEmbedding(img_size, patch_size, num_hiddens)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, num_hiddens))
         seq_len = self.patch_embedding.num_patches + 1
@@ -83,27 +89,41 @@ class ViT(nn.Module):
             nn.Linear(num_hiddens, num_classes)
         )
         
+        
     def forward(self, X):
+        # X: [batch_size, num_channels, img_size, img_size]
         X = self.patch_embedding(X)
+        # X: [batch_size, (img_size//patch_size)**2, num_hiddens] or [batch_size, num_patches, num_hiddens]
+        
+        
         X = torch.cat((self.cls_token.expand(X.shape[0], -1, -1), X), dim=1)
+        # X: [batch_size, (img_size//patch_size)**2 + 1, num_hiddens] or [batch_size, num_patches + 1, num_hiddens]
+        
         X = self.dropout(X + self.positional_embedding)
+        # X: [batch_size, (img_size//patch_size)**2 + 1, num_hiddens] or [batch_size, num_patches + 1, num_hiddens]
+        
         for block in self.blocks:
-            X = block(X)
+            # X: [batch_size, num_patches + 1, num_hiddens]
+            X = block(X) # cls_token 只增加了序列长度，而不会增加特征维度
+            # X: [batch_size, num_patches + 1, num_hiddens]
+            
+        # X[:, 0]: [batch_size, num_hiddens]
         X = self.head(X[:, 0])
+        # X: [batch_size, num_classes]
         return X
     
 if __name__ == '__main__':
     img_size, patch_size = 96, 16
     num_hiddens, mlp_num_hiddens, num_heads, num_blks = 512, 2048, 8, 2
-    emb_dropout, blk_dropout, lr = 0.1, 0.1, 0.1
-    batch_size = 32
-    model = ViT(img_size, patch_size, num_hiddens, mlp_num_hiddens, num_heads,
-                num_blks, emb_dropout, blk_dropout, lr)
+    emb_dropout, blk_dropout, lr = 0.1, 0.1, 1e-3
+    batch_size = 128
+    model = ViT(img_size, patch_size, num_hiddens, mlp_num_hiddens, 
+                num_heads, num_blks, emb_dropout, blk_dropout, lr)
     
     train_iter, test_iter = load_data_fashion_mnist(batch_size=batch_size, resize=(img_size, img_size))
     
     max_epochs = 10
-    device = torch.device('cuda')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     loss = nn.CrossEntropyLoss(reduction='none')
     trainer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -114,17 +134,28 @@ if __name__ == '__main__':
     
     for epoch in range(max_epochs):
         model.train()
-        for X, y in train_iter:
+        for X, y in tqdm(train_iter, desc=f'Epoch {epoch}', unit='batch'):
             trainer.zero_grad()
-            X, y = X.to(device), y.to(device)
+            X, y = X.to(device), y.to(device) 
+            # X: [batch_size, num_channels, img_size, img_size]
+            # y: [batch_size,]
+            
             y_pred = model(X)
             l = loss(y_pred, y)
-            l.backward()
+            l.mean().backward()
             trainer.step()
         loss_list.append(l.mean().item())
         print(f'Epoch {epoch}, Loss: {l.mean():.4f}')
         
         model.eval()
-        acc = evaluate_accuracy(model, test_iter, device)
+        acc = evaluate_accuracy(model, test_iter)
         acc_list.append(acc)
         print(f'Epoch {epoch}, Test acc: {acc:.4f}')
+        break
+
+    plt.plot(range(max_epochs), loss_list)
+    plt.plot(range(max_epochs), acc_list)
+    plt.legend(['loss', 'acc'])
+    plt.xlabel('epoch')
+    plt.ylabel('value')
+    plt.show()
